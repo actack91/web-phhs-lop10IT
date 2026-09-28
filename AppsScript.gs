@@ -32,7 +32,11 @@ function doGet(e) {
   try {
     if (mode.indexOf("hw-") === 0) return output(hwPublishHandle(parameters), callback);
 
-    if (mode === "score-archive" || mode === "score-restore") return output(scoreArchiveAction(parameters), callback);
+    if (mode === "score-delete") return output(scoreDeleteAction(parameters), callback);
+    if (mode === "score-archive" || mode === "score-restore") {
+      assertAdminKey(parameters.adminKey);
+      throw new Error("Chức năng khôi phục đã ngừng. Hãy mở bản web mới để xóa vĩnh viễn.");
+    }
 
     // Lightweight authentication: never open or scan a spreadsheet here.
     if (mode === "admin-check") {
@@ -1395,7 +1399,8 @@ function readScoreBookForAdmin(ss) {
   });
 
   return {
-    deletedTests: (values[2] || []).map((code,col) => ({code:String(code).replace(/^ARCHIVED_/, ""), title:String((values[3]||[])[col]||""), archived:String(code).indexOf("ARCHIVED_")===0})).filter(t=>t.archived),
+    permanentDeletion: true,
+    deletedTests: (values[2] || []).map((code,col) => ({code:String(code).replace(/^ARCHIVED_/, ""), title:String((values[3]||[])[col]||""), revision:scoreTestRevision(values,notes,col), archived:String(code).indexOf("ARCHIVED_")===0})).filter(t=>t.archived).concat(scoreDeletedCodes().map(code=>({code:code,permanent:true}))),
     tests: tests,
     students: rows
   };
@@ -1415,6 +1420,8 @@ function saveScoreBookForAdmin(ss, input) {
     const title = String(testInput.title || "").trim();
     const date = String(testInput.date || "").trim();
     let testCode = String(testInput.code || "").trim().toUpperCase();
+    const permanentlyDeleted = scoreDeletedCodes();
+    if (permanentlyDeleted.indexOf(testCode) >= 0) throw new Error("Bài kiểm tra đã bị xóa vĩnh viễn. Không thể lưu hoặc khôi phục bài này.");
 
     if (!subjectMap[subjectCode]) throw new Error("Môn học không hợp lệ.");
     if (!title) throw new Error("Tên bài kiểm tra không được để trống.");
@@ -1441,7 +1448,7 @@ function saveScoreBookForAdmin(ss, input) {
       if (!testInput.recoverMissing && testInput.revision && testInput.revision !== scoreTestRevision(sheet.getDataRange().getDisplayValues(),sheet.getDataRange().getNotes(),targetColumn-1)) throw new Error("Điểm trên Sheet đã thay đổi. Bản nhập trên máy vẫn được giữ; hãy sao lưu rồi tải điểm mới nhất để đối chiếu.");
     } else {
       let nextNumber = 1;
-      codes.forEach(value => {
+      codes.concat(permanentlyDeleted).forEach(value => {
         const match = String(value || "").trim().toUpperCase().replace(/^ARCHIVED_/, "")
           .match(new RegExp("^" + subjectCode + "_BAI_(\\d+)$"));
         if (match) nextNumber = Math.max(nextNumber, Number(match[1]) + 1);
@@ -2116,6 +2123,16 @@ function scoreTestRevision(values, notes, column) {
   return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify(values.map((row,i)=>[row[0],row[column],(notes[i]||[])[column]]))));
 }
 function scoreArchiveAction(parameters) {
+  throw new Error("Chức năng khôi phục đã ngừng.");
+}
+
+// Only identifiers remain, to prevent old browsers from recreating deleted tests.
+function scoreDeletedCodes() {
+  const properties=PropertiesService.getScriptProperties().getProperties();
+  return Object.keys(properties).filter(key=>key.indexOf("SCORE_DELETED_V1_")===0).map(key=>key.slice("SCORE_DELETED_V1_".length));
+}
+
+function scoreDeleteAction(parameters) {
   assertAdminKey(parameters.adminKey);
   const lock=LockService.getScriptLock(); lock.waitLock(20000);
   try {
@@ -2123,13 +2140,19 @@ function scoreArchiveAction(parameters) {
     if(!sheet) throw new Error("Không tìm thấy bảng điểm.");
     const code=String(parameters.testCode||"").trim().toUpperCase();
     if(!/^(TOAN|VAN|ANH|LY|HOA|SINH)_BAI_\d+$/.test(code)) throw new Error("Mã bài kiểm tra không hợp lệ.");
-    const restore=parameters.mode==="score-restore", values=sheet.getDataRange().getDisplayValues();
-    const from=restore?"ARCHIVED_"+code:code, to=restore?code:"ARCHIVED_"+code;
-    const col=(values[2]||[]).findIndex(v=>String(v).trim().toUpperCase()===from);
-    if(col<2) throw new Error("Bài đã thay đổi. Hãy tải lại danh sách.");
-    if((values[2]||[]).some(v=>String(v).trim().toUpperCase()===to)) throw new Error("Mã bài bị trùng, cần kiểm tra Sheet.");
-    if(!restore && parameters.revision && parameters.revision!==scoreTestRevision(values,sheet.getDataRange().getNotes(),col)) throw new Error("Điểm trên Sheet đã thay đổi. Hãy tải lại trước khi xóa.");
-    sheet.getRange(3,col+1).setValue(to); SpreadsheetApp.flush();
+    if(parameters.confirmPermanent!=="yes") throw new Error("Cần xác nhận xóa vĩnh viễn bài kiểm tra.");
+    const values=sheet.getDataRange().getDisplayValues();
+    const matches=(values[2]||[]).map((v,col)=>({value:String(v).trim().toUpperCase(),col})).filter(x=>x.col>=2&&(x.value===code||x.value==="ARCHIVED_"+code));
+    if(matches.length>1) throw new Error("Mã bài bị trùng, cần kiểm tra Sheet trước khi xóa.");
+    if(matches.length) {
+      const col=matches[0].col;
+      if(!parameters.revision || parameters.revision!==scoreTestRevision(values,sheet.getDataRange().getNotes(),col)) throw new Error("Điểm trên Sheet đã thay đổi. Hãy tải lại và kiểm tra trước khi xóa.");
+      PropertiesService.getScriptProperties().setProperty("SCORE_DELETED_V1_"+code,"1");
+      sheet.deleteColumn(col+1);
+      SpreadsheetApp.flush();
+    } else if(scoreDeletedCodes().indexOf(code)<0) {
+      throw new Error("Không tìm thấy bài kiểm tra. Hãy tải lại danh sách.");
+    }
     return {ok:true,updatedAt:new Date().toISOString(),scoreBook:readScoreBookForAdmin(ss)};
   } finally {lock.releaseLock();}
 }
