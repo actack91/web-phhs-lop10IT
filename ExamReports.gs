@@ -1,0 +1,92 @@
+// Exam reports: independent periods; no changes to existing test score columns.
+function erSubjects(){return ['TOAN','VAN','ANH','LY','HOA','TIN'];}
+// Subject mappings cross-checked against official university admissions tables (2026).
+function erBlocks(){return {A00:['TOAN','LY','HOA'],A01:['TOAN','LY','ANH'],C01:['VAN','TOAN','LY'],C02:['VAN','TOAN','HOA'],C05:['VAN','LY','HOA'],D01:['VAN','TOAN','ANH'],D07:['TOAN','HOA','ANH'],D11:['VAN','LY','ANH'],D12:['VAN','HOA','ANH'],X02:['TOAN','VAN','TIN'],X06:['TOAN','LY','TIN'],X10:['TOAN','HOA','TIN'],X26:['TOAN','TIN','ANH']};}
+function erHash(value){return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,JSON.stringify(value)));}
+function erChoices(registration){
+ const raw=String(registration||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
+ const explicit=raw.match(/[A-Z]\d{2}/g)||[],subjects=[];
+ if(explicit.length)explicit.forEach(code=>(erBlocks()[code]||[]).forEach(s=>subjects.push(s)));
+ else ['ANH','LY','HOA','TIN'].forEach(s=>{if(new RegExp('(^|[^A-Z])'+s+'([^A-Z]|$)').test(raw))subjects.push(s);});
+ const choices=Array.from(new Set(subjects.filter(s=>['ANH','LY','HOA','TIN'].includes(s))));return choices.length===2?choices:[];
+}
+function erTable(name,headers,create){
+ const ss=SpreadsheetApp.getActiveSpreadsheet();let sheet=ss.getSheetByName(name);
+ if(!sheet&&create){sheet=ss.insertSheet(name);sheet.getRange(1,1,1,headers.length).setValues([headers]);sheet.setFrozenRows(1);sheet.getRange('A:B').setNumberFormat('@');}
+ if(!sheet)return {sheet:null,rows:[]};
+ const values=sheet.getDataRange().getDisplayValues();
+ if(JSON.stringify(values[0].slice(0,headers.length))!==JSON.stringify(headers))throw new Error('Cấu trúc '+name+' đã thay đổi. Hãy kiểm tra tiêu đề cột.');
+ return {sheet,rows:values.slice(1).filter(r=>r[0])};
+}
+function erPeriods(create){return erTable('KY_THI',['MaKy','NamHoc','TenKy','Ngay','TrangThai','CapNhatLuc'],create);}
+function erScores(create){return erTable('DIEM_KY_THI',['MaKy','MaHS','TOAN','VAN','ANH','LY','HOA','TIN','TuChon1','TuChon2','CapNhatLuc'],create);}
+function erRoster(){return getClassList().filter(s=>String(s.studentCode||'').trim()).map(s=>({code:String(s.studentCode).trim(),name:s.name,block:String(s.khoiThi||'').trim().toUpperCase(),goal:s.tongDiemMucTieu||''}));}
+function erNumber(v){if(v===null||v===undefined||String(v).trim()==='')return null;const t=String(v).trim().replace(',','.');if(!/^\d+(\.\d{1,2})?$/.test(t))return null;const n=Number(t);return n>=0&&n<=10?n:null;}
+function erRecord(row){const scores={};erSubjects().forEach((s,i)=>scores[s]=erNumber(row[i+2]));return {code:String(row[1]),scores,electives:row.slice(8,10).filter(Boolean),revision:erHash(row)};}
+function erRead(){
+ const periods=erPeriods(false).rows,scores=erScores(false).rows,roster=erRoster(),valid=new Set(roster.map(s=>s.code));
+ const seen=new Set();scores.forEach(r=>{const key=r[0]+'|'+r[1];if(seen.has(key))throw new Error('Có dòng điểm trùng mã kỳ và mã học sinh trong DIEM_KY_THI.');seen.add(key);});
+ const ids=new Set();periods.forEach(r=>{if(ids.has(r[0]))throw new Error('Có mã kỳ thi trùng trong KY_THI.');ids.add(r[0]);});
+ return {roster,periods:periods.map(p=>{const rows=scores.filter(r=>r[0]===p[0]&&valid.has(String(r[1])));return {id:p[0],year:p[1],title:p[2],date:p[3],published:p[4]==='PUBLISHED',revision:erHash([p,rows]),rows:rows.map(erRecord)};})};
+}
+function erTotal(scores,subjects){if(!subjects||!subjects.length||subjects.some(s=>scores[s]===null||scores[s]===undefined))return null;return subjects.reduce((sum,s)=>sum+Math.round(scores[s]*100),0)/100;}
+function erStats(value,values){const nums=values.filter(v=>v!==null&&Number.isFinite(v));return {value,average:nums.length?nums.reduce((a,b)=>a+b,0)/nums.length:null,rank:value===null?null:1+nums.filter(v=>Math.round(v*100)>Math.round(value*100)).length,count:nums.length};}
+function erRecommend(scores){
+ const electives=['ANH','LY','HOA','TIN'];
+ if(electives.some(k=>erNumber(scores[k])===null))return {ready:false,pairs:[],message:'Cần đủ điểm Anh, Lý, Hóa, Tin để gợi ý công bằng.'};
+ const pairs=[];for(let i=0;i<4;i++)for(let j=i+1;j<4;j++)pairs.push({subjects:[electives[i],electives[j]],total:Math.round((erNumber(scores[electives[i]])+erNumber(scores[electives[j]]))*100)/100});
+ pairs.sort((a,b)=>b.total-a.total);return {ready:true,pairs:pairs.filter(p=>p.total===pairs[0].total),message:'Gợi ý theo 2 điểm môn cao nhất ở kỳ này; không phải đăng ký môn thi. Điểm giữa các môn có thể khác độ khó.'};
+}
+function erReport(period,student,roster){
+ const rows=period.rows,own=rows.find(r=>r.code===student.code)||{scores:{},electives:[]};
+ const subjects=erSubjects().map(code=>({code,...erStats(erNumber(own.scores[code]),rows.map(r=>erNumber(r.scores[code])))}));
+ const recommendation=erRecommend(own.scores),map=erBlocks();
+ const blocks=Object.keys(map).map(code=>({code,subjects:map[code],...erStats(erTotal(own.scores,map[code]),rows.map(r=>erTotal(r.scores,map[code])))}));
+ blocks.sort((a,b)=>(b.value??-1)-(a.value??-1)||a.code.localeCompare(b.code));
+ return {id:period.id,title:period.title,year:period.year,date:period.date,subjects,blocks,recommendation};
+}
+
+function erParentReports(studentCode){const book=erRead(),student=book.roster.find(s=>s.code===String(studentCode));if(!student)return [];return book.periods.filter(p=>p.published).map(p=>erReport(p,student,book.roster));}
+function examHandle(p){
+ assertAdminKey(p.adminKey);
+ if(p.mode==='exam-book')return {ok:true,book:erRead()};
+ const lock=LockService.getScriptLock();lock.waitLock(20000);
+ try{
+  const now=new Date().toISOString();
+  if(p.mode==='exam-create'){
+   const year=String(p.year||'').trim(),title=String(p.title||'').trim(),id=String(p.id||'');
+   if(!/^\d{4}-\d{4}$/.test(year)||!title||title.length>100||!/^[a-zA-Z0-9_-]{8,80}$/.test(id))throw new Error('Tên kỳ, năm học hoặc mã kỳ không hợp lệ.');
+   if(p.date&&!/^\d{4}-\d{2}-\d{2}$/.test(p.date))throw new Error('Ngày thi không hợp lệ.');
+   const table=erPeriods(true),existing=table.rows.find(r=>r[0]===id);
+   if(existing){if(existing[1]!==year||existing[2]!==title)throw new Error('Mã kỳ đã được dùng.');return {ok:true,book:erRead(),id};}
+   if(table.rows.some(r=>r[1]===year&&r[2].toLowerCase()===title.toLowerCase()))throw new Error('Đã có kỳ thi cùng tên trong năm học này. Hãy chọn kỳ đã tạo.');
+   table.sheet.appendRow([id,year,title,String(p.date||''),'DRAFT',now]);
+   return {ok:true,book:erRead(),id};
+  }
+  const book=erRead(),period=book.periods.find(x=>x.id===p.id);if(!period)throw new Error('Không tìm thấy kỳ thi.');
+  if(p.mode==='exam-save-row'){
+   const student=book.roster.find(x=>x.code===String(p.code));if(!student)throw new Error('Học sinh không thuộc danh sách lớp.');
+   let input;try{input=JSON.parse(p.data);}catch(e){throw new Error('Dữ liệu điểm không hợp lệ.');}
+   if(!input||!Array.isArray(input.scores)||input.scores.length!==6||!Array.isArray(input.electives))throw new Error('Cần đủ 6 ô điểm.');
+   const choices=input.electives;if(choices.length!==0)throw new Error('10IT chưa đăng ký môn thi; chỉ lưu 6 môn điểm.');
+   const numbers=input.scores.map(v=>{const n=erNumber(v);if(n===null&&v!==null&&v!==undefined&&String(v).trim()!=='')throw new Error('Điểm phải từ 0 đến 10, tối đa 2 chữ số thập phân.');return n===null?'':n;});
+   const table=erScores(true),index=table.rows.findIndex(r=>r[0]===p.id&&r[1]===String(p.code)),old=index>=0?table.rows[index]:null;
+   const row=[p.id,String(p.code)].concat(numbers,['',''],[now]);
+   // Retrying an already committed row after a lost response is safe.
+   if(old&&JSON.stringify(erRecord(old).scores)===JSON.stringify(erRecord(row).scores)&&JSON.stringify(old.slice(8,10).filter(Boolean))===JSON.stringify(choices))return {ok:true,record:erRecord(old)};
+   if((old?erHash(old):'')!==String(p.revision||''))throw new Error('Điểm trên Sheet đã thay đổi. Tải lại rồi đối chiếu trước khi lưu.');
+   // Any edit returns the period to draft so PHHS never sees a partially saved batch.
+   const pt=erPeriods(false).sheet,all=pt.getDataRange().getDisplayValues(),pi=all.findIndex(r=>r[0]===p.id);pt.getRange(pi+1,5,1,2).setValues([['DRAFT',now]]);
+   const written=row.slice();written[1]="\'"+String(p.code);
+   if(index>=0){const all=table.sheet.getDataRange().getDisplayValues();const actual=all.findIndex((r,i)=>i>0&&r[0]===p.id&&r[1]===String(p.code));if(actual<1)throw new Error('Không tìm thấy dòng điểm để cập nhật.');table.sheet.getRange(actual+1,1,1,11).setValues([written]);}else table.sheet.appendRow(written);
+   SpreadsheetApp.flush();
+   const saved=erScores(false).rows.find(r=>r[0]===p.id&&r[1]===String(p.code));if(!saved)throw new Error('Chưa xác nhận được mã học sinh sau khi ghi. Giữ bản nhập và thử lại.');return {ok:true,record:erRecord(saved)};
+  }
+  if(p.mode==='exam-publish'){
+   if(period.revision!==p.revision)throw new Error('Dữ liệu đã thay đổi. Tải lại và kiểm tra trước khi công bố.');
+   if(p.published==='yes'&&!period.rows.some(r=>erSubjects().some(s=>r.scores[s]!==null)))throw new Error('Chưa có điểm để công bố.');
+   const t=erPeriods(false).sheet,values=t.getDataRange().getDisplayValues(),index=values.findIndex(r=>r[0]===p.id);t.getRange(index+1,5,1,2).setValues([[p.published==='yes'?'PUBLISHED':'DRAFT',now]]);SpreadsheetApp.flush();return {ok:true,book:erRead()};
+  }
+  throw new Error('Thao tác kỳ thi không hợp lệ.');
+ }finally{lock.releaseLock();}
+}
